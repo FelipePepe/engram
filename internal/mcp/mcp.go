@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/alanbuscaglia/engram/internal/store"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -19,6 +20,14 @@ var suggestTopicKey = store.SuggestTopicKey
 
 var loadMCPStats = func(s *store.Store) (*store.Stats, error) {
 	return s.Stats()
+}
+
+func ensureSessionID(s *store.Store, sessionID, project string) string {
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("mcp-%d", time.Now().UnixNano())
+	}
+	_ = s.CreateSession(sessionID, project, "")
+	return sessionID
 }
 
 func NewServer(s *store.Store) *server.MCPServer {
@@ -410,13 +419,8 @@ func handleSave(s *store.Store) server.ToolHandlerFunc {
 		if typ == "" {
 			typ = "manual"
 		}
-		if sessionID == "" {
-			sessionID = "manual-save"
-		}
+		sessionID = ensureSessionID(s, sessionID, project)
 		suggestedTopicKey := suggestTopicKey(typ, title, content)
-
-		// Ensure the session exists
-		s.CreateSession(sessionID, project, "")
 
 		_, err := s.AddObservation(store.AddObservationParams{
 			SessionID: sessionID,
@@ -524,12 +528,7 @@ func handleSavePrompt(s *store.Store) server.ToolHandlerFunc {
 		sessionID, _ := req.GetArguments()["session_id"].(string)
 		project, _ := req.GetArguments()["project"].(string)
 
-		if sessionID == "" {
-			sessionID = "manual-save"
-		}
-
-		// Ensure the session exists
-		s.CreateSession(sessionID, project, "")
+		sessionID = ensureSessionID(s, sessionID, project)
 
 		_, err := s.AddPrompt(store.AddPromptParams{
 			SessionID: sessionID,
@@ -691,12 +690,7 @@ func handleSessionSummary(s *store.Store) server.ToolHandlerFunc {
 		sessionID, _ := req.GetArguments()["session_id"].(string)
 		project, _ := req.GetArguments()["project"].(string)
 
-		if sessionID == "" {
-			sessionID = "manual-save"
-		}
-
-		// Ensure the session exists
-		s.CreateSession(sessionID, project, "")
+		sessionID = ensureSessionID(s, sessionID, project)
 
 		_, err := s.AddObservation(store.AddObservationParams{
 			SessionID: sessionID,
@@ -751,10 +745,7 @@ func handleCapturePassive(s *store.Store) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("content is required — include text with a '## Key Learnings:' section"), nil
 		}
 
-		if sessionID == "" {
-			sessionID = "manual-save"
-			_ = s.CreateSession(sessionID, project, "")
-		}
+		sessionID = ensureSessionID(s, sessionID, project)
 
 		if source == "" {
 			source = "mcp-passive"
