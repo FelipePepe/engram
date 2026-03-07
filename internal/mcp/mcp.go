@@ -25,8 +25,8 @@ var loadMCPStats = func(s *store.Store) (*store.Stats, error) {
 func ensureSessionID(s *store.Store, sessionID, project string) string {
 	if sessionID == "" {
 		sessionID = fmt.Sprintf("mcp-%d", time.Now().UnixNano())
+		_ = s.CreateSession(sessionID, project, "")
 	}
-	_ = s.CreateSession(sessionID, project, "")
 	return sessionID
 }
 
