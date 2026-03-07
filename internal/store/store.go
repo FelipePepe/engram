@@ -6,6 +6,7 @@
 package store
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -42,6 +43,7 @@ type Observation struct {
 	ToolName       *string `json:"tool_name,omitempty"`
 	Project        *string `json:"project,omitempty"`
 	Scope          string  `json:"scope"`
+	Category       string  `json:"category"` // general|personal|task|tool
 	TopicKey       *string `json:"topic_key,omitempty"`
 	RevisionCount  int     `json:"revision_count"`
 	DuplicateCount int     `json:"duplicate_count"`
@@ -81,6 +83,7 @@ type TimelineEntry struct {
 	ToolName       *string `json:"tool_name,omitempty"`
 	Project        *string `json:"project,omitempty"`
 	Scope          string  `json:"scope"`
+	Category       string  `json:"category"`
 	TopicKey       *string `json:"topic_key,omitempty"`
 	RevisionCount  int     `json:"revision_count"`
 	DuplicateCount int     `json:"duplicate_count"`
@@ -100,10 +103,11 @@ type TimelineResult struct {
 }
 
 type SearchOptions struct {
-	Type    string `json:"type,omitempty"`
-	Project string `json:"project,omitempty"`
-	Scope   string `json:"scope,omitempty"`
-	Limit   int    `json:"limit,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Project  string `json:"project,omitempty"`
+	Scope    string `json:"scope,omitempty"`
+	Category string `json:"category,omitempty"`
+	Limit    int    `json:"limit,omitempty"`
 }
 
 type AddObservationParams struct {
@@ -114,6 +118,7 @@ type AddObservationParams struct {
 	ToolName  string `json:"tool_name,omitempty"`
 	Project   string `json:"project,omitempty"`
 	Scope     string `json:"scope,omitempty"`
+	Category  string `json:"category,omitempty"`
 	TopicKey  string `json:"topic_key,omitempty"`
 }
 
@@ -123,6 +128,7 @@ type UpdateObservationParams struct {
 	Content  *string `json:"content,omitempty"`
 	Project  *string `json:"project,omitempty"`
 	Scope    *string `json:"scope,omitempty"`
+	Category *string `json:"category,omitempty"`
 	TopicKey *string `json:"topic_key,omitempty"`
 }
 
@@ -138,6 +144,24 @@ type AddPromptParams struct {
 	SessionID string `json:"session_id"`
 	Content   string `json:"content"`
 	Project   string `json:"project,omitempty"`
+}
+
+// ─── Tool Results ─────────────────────────────────────────────────────────────
+
+// ToolResultParams holds parameters for saving a large tool output to disk.
+type ToolResultParams struct {
+	Content   string
+	SessionID string
+	Project   string
+	Retention time.Duration // default 7 days
+}
+
+// ToolResultSaved is returned after saving a tool result.
+type ToolResultSaved struct {
+	ID        string `json:"id"`
+	FilePath  string `json:"file_path"`
+	SizeBytes int    `json:"size_bytes"`
+	ExpiresAt string `json:"expires_at"`
 }
 
 // ExportData is the full serializable dump of the engram database.
@@ -313,6 +337,9 @@ func New(cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("engram: migration: %w", err)
 	}
 
+	// Cleanup expired tool results on startup (non-fatal)
+	s.CleanupToolResults()
+
 	return s, nil
 }
 
@@ -392,6 +419,16 @@ func (s *Store) migrate() error {
 			chunk_id    TEXT PRIMARY KEY,
 			imported_at TEXT NOT NULL DEFAULT (datetime('now'))
 		);
+
+		CREATE TABLE IF NOT EXISTS tool_results (
+			id         TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			project    TEXT,
+			size_bytes INTEGER NOT NULL,
+			file_path  TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
 	`
 	if _, err := s.execHook(s.db, schema); err != nil {
 		return err
@@ -402,6 +439,7 @@ func (s *Store) migrate() error {
 		definition string
 	}{
 		{name: "scope", definition: "TEXT NOT NULL DEFAULT 'project'"},
+		{name: "category", definition: "TEXT NOT NULL DEFAULT 'general'"},
 		{name: "topic_key", definition: "TEXT"},
 		{name: "normalized_hash", definition: "TEXT"},
 		{name: "revision_count", definition: "INTEGER NOT NULL DEFAULT 1"},
@@ -421,10 +459,11 @@ func (s *Store) migrate() error {
 	}
 
 	if _, err := s.execHook(s.db, `
-		CREATE INDEX IF NOT EXISTS idx_obs_scope ON observations(scope);
-		CREATE INDEX IF NOT EXISTS idx_obs_topic ON observations(topic_key, project, scope, updated_at DESC);
-		CREATE INDEX IF NOT EXISTS idx_obs_deleted ON observations(deleted_at);
-		CREATE INDEX IF NOT EXISTS idx_obs_dedupe ON observations(normalized_hash, project, scope, type, title, created_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_obs_scope    ON observations(scope);
+		CREATE INDEX IF NOT EXISTS idx_obs_category ON observations(category);
+		CREATE INDEX IF NOT EXISTS idx_obs_topic    ON observations(topic_key, project, scope, updated_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_obs_deleted  ON observations(deleted_at);
+		CREATE INDEX IF NOT EXISTS idx_obs_dedupe   ON observations(normalized_hash, project, scope, type, title, created_at DESC);
 	`); err != nil {
 		return err
 	}
@@ -628,7 +667,7 @@ func (s *Store) AllObservations(project, scope string, limit int) ([]Observation
 
 	query := `
 		SELECT o.id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at
+		       o.scope, o.category, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at
 		FROM observations o
 		WHERE o.deleted_at IS NULL
 	`
@@ -657,7 +696,7 @@ func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation,
 
 	query := `
 		SELECT id, session_id, type, title, content, tool_name, project,
-		       scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		       scope, category, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
 		FROM observations
 		WHERE session_id = ? AND deleted_at IS NULL
 		ORDER BY created_at ASC
@@ -677,6 +716,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 		content = content[:s.cfg.MaxObservationLength] + "... [truncated]"
 	}
 	scope := normalizeScope(p.Scope)
+	category := normalizeCategory(p.Category)
 	normHash := hashNormalized(content)
 	topicKey := normalizeTopicKey(p.TopicKey)
 
@@ -699,6 +739,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 				     title = ?,
 				     content = ?,
 				     tool_name = ?,
+				     category = ?,
 				     topic_key = ?,
 				     normalized_hash = ?,
 				     revision_count = revision_count + 1,
@@ -709,6 +750,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 				title,
 				content,
 				nullableString(p.ToolName),
+				category,
 				nullableString(topicKey),
 				normHash,
 				existingID,
@@ -755,10 +797,10 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	}
 
 	res, err := s.execHook(s.db,
-		`INSERT INTO observations (session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, datetime('now'), datetime('now'))`,
+		`INSERT INTO observations (session_id, type, title, content, tool_name, project, scope, category, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, datetime('now'), datetime('now'))`,
 		p.SessionID, p.Type, title, content,
-		nullableString(p.ToolName), nullableString(p.Project), scope, nullableString(topicKey), normHash,
+		nullableString(p.ToolName), nullableString(p.Project), scope, category, nullableString(topicKey), normHash,
 	)
 	if err != nil {
 		return 0, err
@@ -773,7 +815,7 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]Observat
 
 	query := `
 		SELECT o.id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at
+		       o.scope, o.category, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at
 		FROM observations o
 		WHERE o.deleted_at IS NULL
 	`
@@ -890,13 +932,13 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 func (s *Store) GetObservation(id int64) (*Observation, error) {
 	row := s.db.QueryRow(
 		`SELECT id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		        scope, category, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
 		 FROM observations WHERE id = ? AND deleted_at IS NULL`, id,
 	)
 	var o Observation
 	if err := row.Scan(
 		&o.ID, &o.SessionID, &o.Type, &o.Title, &o.Content,
-		&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
+		&o.ToolName, &o.Project, &o.Scope, &o.Category, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
 		&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
 	); err != nil {
 		return nil, err
@@ -918,6 +960,7 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 		project = *obs.Project
 	}
 	scope := obs.Scope
+	category := obs.Category
 	topicKey := ""
 	if obs.TopicKey != nil {
 		topicKey = *obs.TopicKey
@@ -941,6 +984,9 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 	if p.Scope != nil {
 		scope = normalizeScope(*p.Scope)
 	}
+	if p.Category != nil {
+		category = normalizeCategory(*p.Category)
+	}
 	if p.TopicKey != nil {
 		topicKey = normalizeTopicKey(*p.TopicKey)
 	}
@@ -952,6 +998,7 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 		     content = ?,
 		     project = ?,
 		     scope = ?,
+		     category = ?,
 		     topic_key = ?,
 		     normalized_hash = ?,
 		     revision_count = revision_count + 1,
@@ -962,6 +1009,7 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 		content,
 		nullableString(project),
 		scope,
+		category,
 		nullableString(topicKey),
 		hashNormalized(content),
 		id,
@@ -1019,7 +1067,7 @@ func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResul
 	// 3. Get observations BEFORE the focus (same session, older, chronological order)
 	beforeRows, err := s.queryItHook(s.db, `
 		SELECT id, session_id, type, title, content, tool_name, project,
-		       scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		       scope, category, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
 		FROM observations
 		WHERE session_id = ? AND id < ? AND deleted_at IS NULL
 		ORDER BY id DESC
@@ -1035,7 +1083,7 @@ func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResul
 		var e TimelineEntry
 		if err := beforeRows.Scan(
 			&e.ID, &e.SessionID, &e.Type, &e.Title, &e.Content,
-			&e.ToolName, &e.Project, &e.Scope, &e.TopicKey, &e.RevisionCount, &e.DuplicateCount, &e.LastSeenAt,
+			&e.ToolName, &e.Project, &e.Scope, &e.Category, &e.TopicKey, &e.RevisionCount, &e.DuplicateCount, &e.LastSeenAt,
 			&e.CreatedAt, &e.UpdatedAt, &e.DeletedAt,
 		); err != nil {
 			return nil, err
@@ -1053,7 +1101,7 @@ func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResul
 	// 4. Get observations AFTER the focus (same session, newer, chronological order)
 	afterRows, err := s.queryItHook(s.db, `
 		SELECT id, session_id, type, title, content, tool_name, project,
-		       scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		       scope, category, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
 		FROM observations
 		WHERE session_id = ? AND id > ? AND deleted_at IS NULL
 		ORDER BY id ASC
@@ -1069,7 +1117,7 @@ func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResul
 		var e TimelineEntry
 		if err := afterRows.Scan(
 			&e.ID, &e.SessionID, &e.Type, &e.Title, &e.Content,
-			&e.ToolName, &e.Project, &e.Scope, &e.TopicKey, &e.RevisionCount, &e.DuplicateCount, &e.LastSeenAt,
+			&e.ToolName, &e.Project, &e.Scope, &e.Category, &e.TopicKey, &e.RevisionCount, &e.DuplicateCount, &e.LastSeenAt,
 			&e.CreatedAt, &e.UpdatedAt, &e.DeletedAt,
 		); err != nil {
 			return nil, err
@@ -1111,7 +1159,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 
 	sql := `
 		SELECT o.id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at,
+		       o.scope, o.category, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at,
 		       fts.rank
 		FROM observations_fts fts
 		JOIN observations o ON o.id = fts.rowid
@@ -1134,6 +1182,11 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		args = append(args, normalizeScope(opts.Scope))
 	}
 
+	if opts.Category != "" {
+		sql += " AND o.category = ?"
+		args = append(args, normalizeCategory(opts.Category))
+	}
+
 	sql += " ORDER BY fts.rank LIMIT ?"
 	args = append(args, limit)
 
@@ -1148,7 +1201,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		var sr SearchResult
 		if err := rows.Scan(
 			&sr.ID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
-			&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
+			&sr.ToolName, &sr.Project, &sr.Scope, &sr.Category, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
 			&sr.LastSeenAt, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
 			&sr.Rank,
 		); err != nil {
@@ -1206,8 +1259,28 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		return "", nil
 	}
 
+	// Separate checkpoints from regular observations
+	var checkpoints []Observation
+	var regular []Observation
+	for _, obs := range observations {
+		if obs.Type == "checkpoint" {
+			checkpoints = append(checkpoints, obs)
+		} else {
+			regular = append(regular, obs)
+		}
+	}
+
 	var b strings.Builder
 	b.WriteString("## Memory from Previous Sessions\n\n")
+
+	// Checkpoints first — they give the most compact state summary
+	if len(checkpoints) > 0 {
+		b.WriteString("### ⚡ Checkpoints\n")
+		for _, obs := range checkpoints {
+			fmt.Fprintf(&b, "- **%s** (%s)\n%s\n\n",
+				obs.Title, obs.CreatedAt, truncate(obs.Content, 500))
+		}
+	}
 
 	if len(sessions) > 0 {
 		b.WriteString("### Recent Sessions\n")
@@ -1230,9 +1303,9 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		b.WriteString("\n")
 	}
 
-	if len(observations) > 0 {
+	if len(regular) > 0 {
 		b.WriteString("### Recent Observations\n")
-		for _, obs := range observations {
+		for _, obs := range regular {
 			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
 				obs.Type, obs.Title, truncate(obs.Content, 300))
 		}
@@ -1272,7 +1345,7 @@ func (s *Store) Export() (*ExportData, error) {
 	// Observations
 	obsRows, err := s.queryItHook(s.db,
 		`SELECT id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		        scope, category, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
 		 FROM observations ORDER BY id`,
 	)
 	if err != nil {
@@ -1283,7 +1356,7 @@ func (s *Store) Export() (*ExportData, error) {
 		var o Observation
 		if err := obsRows.Scan(
 			&o.ID, &o.SessionID, &o.Type, &o.Title, &o.Content,
-			&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
+			&o.ToolName, &o.Project, &o.Scope, &o.Category, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
 			&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
 		); err != nil {
 			return nil, err
@@ -1342,8 +1415,8 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 	// Import observations (use new IDs — AUTOINCREMENT)
 	for _, obs := range data.Observations {
 		_, err := s.execHook(tx,
-			`INSERT INTO observations (session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO observations (session_id, type, title, content, tool_name, project, scope, category, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			obs.SessionID,
 			obs.Type,
 			obs.Title,
@@ -1351,6 +1424,7 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 			obs.ToolName,
 			obs.Project,
 			normalizeScope(obs.Scope),
+			normalizeCategory(obs.Category),
 			nullableString(normalizeTopicKey(derefString(obs.TopicKey))),
 			hashNormalized(obs.Content),
 			maxInt(obs.RevisionCount, 1),
@@ -1390,6 +1464,170 @@ type ImportResult struct {
 	SessionsImported     int `json:"sessions_imported"`
 	ObservationsImported int `json:"observations_imported"`
 	PromptsImported      int `json:"prompts_imported"`
+}
+
+// ─── Daily Digest ─────────────────────────────────────────────────────────────
+
+// GetObservationsByDate returns observations created on a specific date.
+func (s *Store) GetObservationsByDate(date, project, scope string) ([]Observation, error) {
+	query := `
+		SELECT o.id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
+		       o.scope, o.category, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at
+		FROM observations o
+		WHERE date(o.created_at) = ? AND o.deleted_at IS NULL
+	`
+	args := []any{date}
+
+	if project != "" {
+		query += " AND o.project = ?"
+		args = append(args, project)
+	}
+	if scope != "" {
+		query += " AND o.scope = ?"
+		args = append(args, normalizeScope(scope))
+	}
+
+	query += " ORDER BY o.created_at ASC"
+	return s.queryObservations(query, args...)
+}
+
+// GenerateDigest creates a Markdown digest from a list of observations.
+func GenerateDigest(observations []Observation, date, project string) string {
+	if len(observations) == 0 {
+		proj := ""
+		if project != "" {
+			proj = " | Project: " + project
+		}
+		return fmt.Sprintf("# Memory Digest — %s\n\n> No observations found%s\n", date, proj)
+	}
+
+	// Group by type
+	byType := make(map[string][]Observation)
+	typeOrder := []string{}
+	for _, o := range observations {
+		if _, seen := byType[o.Type]; !seen {
+			typeOrder = append(typeOrder, o.Type)
+		}
+		byType[o.Type] = append(byType[o.Type], o)
+	}
+
+	var b strings.Builder
+	proj := ""
+	if project != "" {
+		proj = " | Project: " + project
+	}
+	fmt.Fprintf(&b, "# Memory Digest — %s\n\n> %d observations%s\n\n", date, len(observations), proj)
+
+	for _, typ := range typeOrder {
+		entries := byType[typ]
+		fmt.Fprintf(&b, "## %s (%d)\n\n", strings.Title(strings.ReplaceAll(typ, "_", " ")), len(entries))
+		for _, o := range entries {
+			proj := ""
+			if o.Project != nil {
+				proj = fmt.Sprintf(" | project: %s", *o.Project)
+			}
+			fmt.Fprintf(&b, "### [#%d] %s\n", o.ID, o.Title)
+			fmt.Fprintf(&b, "%s\n\n", o.Content)
+			fmt.Fprintf(&b, "*%s* | scope: %s | category: %s%s\n\n", o.CreatedAt, o.Scope, o.Category, proj)
+		}
+	}
+
+	return b.String()
+}
+
+// ─── Tool Results ─────────────────────────────────────────────────────────────
+
+func (s *Store) toolResultsDir() string {
+	return filepath.Join(s.cfg.DataDir, "tool_results")
+}
+
+func (s *Store) SaveToolResult(p ToolResultParams) (*ToolResultSaved, error) {
+	dir := s.toolResultsDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("tool_results dir: %w", err)
+	}
+
+	id := newUUID()
+	filePath := filepath.Join(dir, id+".txt")
+
+	if err := os.WriteFile(filePath, []byte(p.Content), 0644); err != nil {
+		return nil, fmt.Errorf("write tool result: %w", err)
+	}
+
+	retention := p.Retention
+	if retention <= 0 {
+		retention = 7 * 24 * time.Hour
+	}
+	expiresAt := time.Now().Add(retention).UTC().Format("2006-01-02T15:04:05Z")
+
+	_, err := s.execHook(s.db,
+		`INSERT INTO tool_results (id, session_id, project, size_bytes, file_path, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		id, p.SessionID, nullableString(p.Project), len(p.Content), filePath, expiresAt,
+	)
+	if err != nil {
+		os.Remove(filePath)
+		return nil, fmt.Errorf("insert tool result: %w", err)
+	}
+
+	return &ToolResultSaved{
+		ID:        id,
+		FilePath:  filePath,
+		SizeBytes: len(p.Content),
+		ExpiresAt: expiresAt,
+	}, nil
+}
+
+func (s *Store) GetToolResult(id string) (string, error) {
+	var filePath string
+	err := s.db.QueryRow(
+		`SELECT file_path FROM tool_results WHERE id = ? AND expires_at > datetime('now')`, id,
+	).Scan(&filePath)
+	if err != nil {
+		return "", fmt.Errorf("tool result %q not found or expired", id)
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("read tool result file: %w", err)
+	}
+	return string(data), nil
+}
+
+func (s *Store) CleanupToolResults() (int, error) {
+	rows, err := s.queryItHook(s.db,
+		`SELECT id, file_path FROM tool_results WHERE expires_at <= datetime('now')`,
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	var paths []string
+	for rows.Next() {
+		var id, path string
+		if err := rows.Scan(&id, &path); err != nil {
+			return 0, err
+		}
+		ids = append(ids, id)
+		paths = append(paths, path)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	for _, path := range paths {
+		os.Remove(path)
+	}
+
+	count := 0
+	for _, id := range ids {
+		if _, err := s.execHook(s.db, `DELETE FROM tool_results WHERE id = ?`, id); err == nil {
+			count++
+		}
+	}
+	return count, nil
 }
 
 // ─── Sync Chunk Tracking ─────────────────────────────────────────────────────
@@ -1436,7 +1674,7 @@ func (s *Store) queryObservations(query string, args ...any) ([]Observation, err
 		var o Observation
 		if err := rows.Scan(
 			&o.ID, &o.SessionID, &o.Type, &o.Title, &o.Content,
-			&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
+			&o.ToolName, &o.Project, &o.Scope, &o.Category, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
 			&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
 		); err != nil {
 			return nil, err
@@ -1522,6 +1760,7 @@ func (s *Store) migrateLegacyObservationsTable() error {
 			tool_name  TEXT,
 			project    TEXT,
 			scope      TEXT    NOT NULL DEFAULT 'project',
+			category   TEXT    NOT NULL DEFAULT 'general',
 			topic_key  TEXT,
 			normalized_hash TEXT,
 			revision_count INTEGER NOT NULL DEFAULT 1,
@@ -1539,7 +1778,7 @@ func (s *Store) migrateLegacyObservationsTable() error {
 	if _, err := s.execHook(tx, `
 		INSERT INTO observations_migrated (
 			id, session_id, type, title, content, tool_name, project,
-			scope, topic_key, normalized_hash, revision_count, duplicate_count,
+			scope, category, topic_key, normalized_hash, revision_count, duplicate_count,
 			last_seen_at, created_at, updated_at, deleted_at
 		)
 		SELECT
@@ -1555,6 +1794,7 @@ func (s *Store) migrateLegacyObservationsTable() error {
 			tool_name,
 			project,
 			CASE WHEN scope IS NULL OR scope = '' THEN 'project' ELSE scope END,
+			'general',
 			NULLIF(topic_key, ''),
 			normalized_hash,
 			CASE WHEN revision_count IS NULL OR revision_count < 1 THEN 1 ELSE revision_count END,
@@ -1626,6 +1866,15 @@ func normalizeScope(scope string) string {
 		return "personal"
 	}
 	return "project"
+}
+
+func normalizeCategory(category string) string {
+	v := strings.TrimSpace(strings.ToLower(category))
+	switch v {
+	case "personal", "task", "tool":
+		return v
+	}
+	return "general"
 }
 
 // SuggestTopicKey generates a stable topic key suggestion from type/title/content.
@@ -1961,4 +2210,14 @@ func ClassifyTool(toolName string) string {
 // Now returns the current time formatted for SQLite.
 func Now() string {
 	return time.Now().UTC().Format("2006-01-02 15:04:05")
+}
+
+// newUUID generates a random UUID v4.
+func newUUID() string {
+	var b [16]byte
+	rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

@@ -234,9 +234,11 @@ func (m Model) viewObservationDetail() string {
 	b.WriteString("\n")
 
 	// Metadata rows
-	b.WriteString(fmt.Sprintf("%s %s\n",
+	b.WriteString(fmt.Sprintf("%s %s  %s %s\n",
 		detailLabelStyle.Render("Type:"),
-		typeBadgeStyle.Render(obs.Type)))
+		typeBadgeStyle.Render(obs.Type),
+		detailLabelStyle.Render("Category:"),
+		typeBadgeStyle.Render(obs.Category)))
 
 	b.WriteString(fmt.Sprintf("%s %s\n",
 		detailLabelStyle.Render("Title:"),
