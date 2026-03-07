@@ -92,6 +92,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /export", s.handleExport)
 	s.mux.HandleFunc("POST /import", s.handleImport)
 
+	// Tool results
+	s.mux.HandleFunc("POST /tool-results", s.handleSaveToolResult)
+	s.mux.HandleFunc("GET /tool-results/{id}", s.handleGetToolResult)
+
+	// Digest
+	s.mux.HandleFunc("GET /digest", s.handleDigest)
+
 	// Stats
 	s.mux.HandleFunc("GET /stats", s.handleStats)
 }
@@ -220,10 +227,11 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results, err := s.store.Search(query, store.SearchOptions{
-		Type:    r.URL.Query().Get("type"),
-		Project: r.URL.Query().Get("project"),
-		Scope:   r.URL.Query().Get("scope"),
-		Limit:   queryInt(r, "limit", 10),
+		Type:     r.URL.Query().Get("type"),
+		Project:  r.URL.Query().Get("project"),
+		Scope:    r.URL.Query().Get("scope"),
+		Category: r.URL.Query().Get("category"),
+		Limit:    queryInt(r, "limit", 10),
 	})
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
@@ -264,7 +272,7 @@ func (s *Server) handleUpdateObservation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if body.Type == nil && body.Title == nil && body.Content == nil && body.Project == nil && body.Scope == nil && body.TopicKey == nil {
+	if body.Type == nil && body.Title == nil && body.Content == nil && body.Project == nil && body.Scope == nil && body.Category == nil && body.TopicKey == nil {
 		jsonError(w, http.StatusBadRequest, "at least one field is required")
 		return
 	}
@@ -416,6 +424,64 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, http.StatusOK, result)
+}
+
+// ─── Tool Results ─────────────────────────────────────────────────────────────
+
+func (s *Server) handleSaveToolResult(w http.ResponseWriter, r *http.Request) {
+	var body store.ToolResultParams
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if body.Content == "" || body.SessionID == "" {
+		jsonError(w, http.StatusBadRequest, "content and session_id are required")
+		return
+	}
+
+	saved, err := s.store.SaveToolResult(body)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	jsonResponse(w, http.StatusCreated, saved)
+}
+
+func (s *Server) handleGetToolResult(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	content, err := s.store.GetToolResult(id)
+	if err != nil {
+		jsonError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(content))
+}
+
+// ─── Digest ───────────────────────────────────────────────────────────────────
+
+func (s *Server) handleDigest(w http.ResponseWriter, r *http.Request) {
+	date := r.URL.Query().Get("date")
+	project := r.URL.Query().Get("project")
+	scope := r.URL.Query().Get("scope")
+
+	if date == "" {
+		date = store.Now()[:10]
+	}
+
+	obs, err := s.store.GetObservationsByDate(date, project, scope)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	digest := store.GenerateDigest(obs, date, project)
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(digest))
 }
 
 // ─── Context ─────────────────────────────────────────────────────────────────

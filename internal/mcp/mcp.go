@@ -59,6 +59,9 @@ func registerTools(srv *server.MCPServer, s *store.Store) {
 			mcp.WithString("scope",
 				mcp.Description("Filter by scope: project (default) or personal"),
 			),
+			mcp.WithString("category",
+				mcp.Description("Filter by category: general (default), personal, task, tool"),
+			),
 			mcp.WithNumber("limit",
 				mcp.Description("Max results (default: 10, max: 20)"),
 			),
@@ -115,6 +118,9 @@ Examples:
 			mcp.WithString("scope",
 				mcp.Description("Scope for this observation: project (default) or personal"),
 			),
+			mcp.WithString("category",
+				mcp.Description("Category: general (default), personal, task, tool"),
+			),
 			mcp.WithString("topic_key",
 				mcp.Description("Optional topic identifier for upserts (e.g. architecture/auth-model). Reuses and updates the latest observation in same project+scope."),
 			),
@@ -144,6 +150,9 @@ Examples:
 			),
 			mcp.WithString("scope",
 				mcp.Description("New scope: project or personal"),
+			),
+			mcp.WithString("category",
+				mcp.Description("New category: general, personal, task, tool"),
 			),
 			mcp.WithString("topic_key",
 				mcp.Description("New topic key (normalized internally)"),
@@ -339,6 +348,101 @@ GUIDELINES:
 		handleSessionEnd(s),
 	)
 
+	// ─── mem_checkpoint ──────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_checkpoint",
+			mcp.WithDescription(`Save a structured progress checkpoint during a session. Unlike mem_session_summary (free-form, ends session), mem_checkpoint uses defined fields and can be called multiple times during a session to track progress.
+
+Saved as observation type="checkpoint", category="task". Appears first in mem_context output.
+
+Provide at least one field. Recommended to call when:
+- Completing a major sub-task
+- Before a risky operation
+- When context is getting long and you want to preserve state`),
+			mcp.WithString("goal",
+				mcp.Description("Objective(s) of the current work"),
+			),
+			mcp.WithString("constraints",
+				mcp.Description("User constraints, preferences, or restrictions discovered"),
+			),
+			mcp.WithString("progress",
+				mcp.Description("What is completed / in progress / blocked"),
+			),
+			mcp.WithString("key_decisions",
+				mcp.Description("Decisions made with brief reasoning"),
+			),
+			mcp.WithString("next_steps",
+				mcp.Description("Ordered action plan for what to do next"),
+			),
+			mcp.WithString("critical_context",
+				mcp.Description("Critical paths, function names, error messages, etc."),
+			),
+			mcp.WithString("session_id",
+				mcp.Description("Session ID to associate with"),
+			),
+			mcp.WithString("project",
+				mcp.Description("Project name"),
+			),
+		),
+		handleCheckpoint(s),
+	)
+
+	// ─── mem_digest ──────────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_digest",
+			mcp.WithDescription("Generate a Markdown digest of memory observations for a specific day. Groups observations by type and shows content with metadata. Useful for reviewing what happened during a session or day."),
+			mcp.WithString("date",
+				mcp.Description("Date in YYYY-MM-DD format (default: today)"),
+			),
+			mcp.WithString("project",
+				mcp.Description("Filter by project name"),
+			),
+			mcp.WithString("scope",
+				mcp.Description("Filter by scope: project or personal"),
+			),
+		),
+		handleDigest(s),
+	)
+
+	// ─── mem_compact_tool ────────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_compact_tool",
+			mcp.WithDescription(`Compress large tool outputs to avoid flooding context. If content exceeds threshold, saves the full content to disk and returns a truncated version with a reference ID.
+
+Use this when a tool returns very large output (browser content, file listings, logs) that would overflow the context window. The full content is preserved and can be retrieved later with mem_get_tool_result.`),
+			mcp.WithString("content",
+				mcp.Required(),
+				mcp.Description("The full tool output to potentially compact"),
+			),
+			mcp.WithString("session_id",
+				mcp.Required(),
+				mcp.Description("Current session ID"),
+			),
+			mcp.WithString("project",
+				mcp.Description("Project name"),
+			),
+			mcp.WithNumber("threshold",
+				mcp.Description("Character count threshold for compaction (default: 5000)"),
+			),
+			mcp.WithNumber("keep_chars",
+				mcp.Description("Characters to keep from the start (default: 500)"),
+			),
+		),
+		handleCompactTool(s),
+	)
+
+	// ─── mem_get_tool_result ─────────────────────────────────────────
+	srv.AddTool(
+		mcp.NewTool("mem_get_tool_result",
+			mcp.WithDescription("Retrieve the full content of a previously compacted tool result by its ID."),
+			mcp.WithString("id",
+				mcp.Required(),
+				mcp.Description("The tool result ID returned by mem_compact_tool"),
+			),
+		),
+		handleGetToolResult(s),
+	)
+
 	// ─── mem_capture_passive ─────────────────────────────────────────
 	srv.AddTool(
 		mcp.NewTool("mem_capture_passive",
@@ -373,13 +477,15 @@ func handleSearch(s *store.Store) server.ToolHandlerFunc {
 		typ, _ := req.GetArguments()["type"].(string)
 		project, _ := req.GetArguments()["project"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
+		category, _ := req.GetArguments()["category"].(string)
 		limit := intArg(req, "limit", 10)
 
 		results, err := s.Search(query, store.SearchOptions{
-			Type:    typ,
-			Project: project,
-			Scope:   scope,
-			Limit:   limit,
+			Type:     typ,
+			Project:  project,
+			Scope:    scope,
+			Category: category,
+			Limit:    limit,
 		})
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Search error: %s. Try simpler keywords.", err)), nil
@@ -392,14 +498,14 @@ func handleSearch(s *store.Store) server.ToolHandlerFunc {
 		var b strings.Builder
 		fmt.Fprintf(&b, "Found %d memories:\n\n", len(results))
 		for i, r := range results {
-			project := ""
+			proj := ""
 			if r.Project != nil {
-				project = fmt.Sprintf(" | project: %s", *r.Project)
+				proj = fmt.Sprintf(" | project: %s", *r.Project)
 			}
-			fmt.Fprintf(&b, "[%d] #%d (%s) — %s\n    %s\n    %s%s | scope: %s\n\n",
-				i+1, r.ID, r.Type, r.Title,
+			fmt.Fprintf(&b, "[%d] #%d (%s) [%s] — %s\n    %s\n    %s%s | scope: %s\n\n",
+				i+1, r.ID, r.Type, r.Category, r.Title,
 				truncate(r.Content, 300),
-				r.CreatedAt, project, r.Scope)
+				r.CreatedAt, proj, r.Scope)
 		}
 
 		return mcp.NewToolResultText(b.String()), nil
@@ -414,6 +520,7 @@ func handleSave(s *store.Store) server.ToolHandlerFunc {
 		sessionID, _ := req.GetArguments()["session_id"].(string)
 		project, _ := req.GetArguments()["project"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
+		category, _ := req.GetArguments()["category"].(string)
 		topicKey, _ := req.GetArguments()["topic_key"].(string)
 
 		if typ == "" {
@@ -429,6 +536,7 @@ func handleSave(s *store.Store) server.ToolHandlerFunc {
 			Content:   content,
 			Project:   project,
 			Scope:     scope,
+			Category:  category,
 			TopicKey:  topicKey,
 		})
 		if err != nil {
@@ -485,11 +593,14 @@ func handleUpdate(s *store.Store) server.ToolHandlerFunc {
 		if v, ok := req.GetArguments()["scope"].(string); ok {
 			update.Scope = &v
 		}
+		if v, ok := req.GetArguments()["category"].(string); ok {
+			update.Category = &v
+		}
 		if v, ok := req.GetArguments()["topic_key"].(string); ok {
 			update.TopicKey = &v
 		}
 
-		if update.Title == nil && update.Content == nil && update.Type == nil && update.Project == nil && update.Scope == nil && update.TopicKey == nil {
+		if update.Title == nil && update.Content == nil && update.Type == nil && update.Project == nil && update.Scope == nil && update.Category == nil && update.TopicKey == nil {
 			return mcp.NewToolResultError("provide at least one field to update"), nil
 		}
 
@@ -657,11 +768,12 @@ func handleGetObservation(s *store.Store) server.ToolHandlerFunc {
 			return mcp.NewToolResultError(fmt.Sprintf("Observation #%d not found", id)), nil
 		}
 
-		project := ""
+		proj := ""
 		if obs.Project != nil {
-			project = fmt.Sprintf("\nProject: %s", *obs.Project)
+			proj = fmt.Sprintf("\nProject: %s", *obs.Project)
 		}
-		scope := fmt.Sprintf("\nScope: %s", obs.Scope)
+		scopeMeta := fmt.Sprintf("\nScope: %s", obs.Scope)
+		categoryMeta := fmt.Sprintf("\nCategory: %s", obs.Category)
 		topic := ""
 		if obs.TopicKey != nil {
 			topic = fmt.Sprintf("\nTopic: %s", *obs.TopicKey)
@@ -673,10 +785,10 @@ func handleGetObservation(s *store.Store) server.ToolHandlerFunc {
 		duplicateMeta := fmt.Sprintf("\nDuplicates: %d", obs.DuplicateCount)
 		revisionMeta := fmt.Sprintf("\nRevisions: %d", obs.RevisionCount)
 
-		result := fmt.Sprintf("#%d [%s] %s\n%s\nSession: %s%s%s\nCreated: %s",
-			obs.ID, obs.Type, obs.Title,
+		result := fmt.Sprintf("#%d [%s] [%s] %s\n%s\nSession: %s%s%s\nCreated: %s",
+			obs.ID, obs.Type, obs.Category, obs.Title,
 			obs.Content,
-			obs.SessionID, project+scope+topic, toolName+duplicateMeta+revisionMeta,
+			obs.SessionID, proj+scopeMeta+categoryMeta+topic, toolName+duplicateMeta+revisionMeta,
 			obs.CreatedAt,
 		)
 
@@ -731,6 +843,140 @@ func handleSessionEnd(s *store.Store) server.ToolHandlerFunc {
 		}
 
 		return mcp.NewToolResultText(fmt.Sprintf("Session %q completed", id)), nil
+	}
+}
+
+func handleCheckpoint(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		goal, _ := req.GetArguments()["goal"].(string)
+		constraints, _ := req.GetArguments()["constraints"].(string)
+		progress, _ := req.GetArguments()["progress"].(string)
+		keyDecisions, _ := req.GetArguments()["key_decisions"].(string)
+		nextSteps, _ := req.GetArguments()["next_steps"].(string)
+		criticalContext, _ := req.GetArguments()["critical_context"].(string)
+		sessionID, _ := req.GetArguments()["session_id"].(string)
+		project, _ := req.GetArguments()["project"].(string)
+
+		// At least one field required
+		if goal == "" && constraints == "" && progress == "" && keyDecisions == "" && nextSteps == "" && criticalContext == "" {
+			return mcp.NewToolResultError("provide at least one field: goal, constraints, progress, key_decisions, next_steps, or critical_context"), nil
+		}
+
+		if sessionID == "" {
+			sessionID = "manual-save"
+		}
+		s.CreateSession(sessionID, project, "")
+
+		// Build structured Markdown checkpoint
+		var b strings.Builder
+		if goal != "" {
+			fmt.Fprintf(&b, "## Goal\n%s\n\n", goal)
+		}
+		if constraints != "" {
+			fmt.Fprintf(&b, "## Constraints\n%s\n\n", constraints)
+		}
+		if progress != "" {
+			fmt.Fprintf(&b, "## Progress\n%s\n\n", progress)
+		}
+		if keyDecisions != "" {
+			fmt.Fprintf(&b, "## Key Decisions\n%s\n\n", keyDecisions)
+		}
+		if nextSteps != "" {
+			fmt.Fprintf(&b, "## Next Steps\n%s\n\n", nextSteps)
+		}
+		if criticalContext != "" {
+			fmt.Fprintf(&b, "## Critical Context\n%s\n\n", criticalContext)
+		}
+		content := strings.TrimSpace(b.String())
+
+		title := "Checkpoint"
+		if goal != "" {
+			title = "Checkpoint: " + truncate(goal, 80)
+		} else if progress != "" {
+			title = "Checkpoint: " + truncate(progress, 80)
+		}
+
+		_, err := s.AddObservation(store.AddObservationParams{
+			SessionID: sessionID,
+			Type:      "checkpoint",
+			Title:     title,
+			Content:   content,
+			Project:   project,
+			Category:  "task",
+		})
+		if err != nil {
+			return mcp.NewToolResultError("Failed to save checkpoint: " + err.Error()), nil
+		}
+
+		return mcp.NewToolResultText(fmt.Sprintf("Checkpoint saved:\n\n%s", content)), nil
+	}
+}
+
+func handleDigest(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		date, _ := req.GetArguments()["date"].(string)
+		project, _ := req.GetArguments()["project"].(string)
+		scope, _ := req.GetArguments()["scope"].(string)
+
+		if date == "" {
+			date = store.Now()[:10]
+		}
+
+		obs, err := s.GetObservationsByDate(date, project, scope)
+		if err != nil {
+			return mcp.NewToolResultError("Failed to get observations: " + err.Error()), nil
+		}
+
+		digest := store.GenerateDigest(obs, date, project)
+		return mcp.NewToolResultText(digest), nil
+	}
+}
+
+func handleCompactTool(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		content, _ := req.GetArguments()["content"].(string)
+		sessionID, _ := req.GetArguments()["session_id"].(string)
+		project, _ := req.GetArguments()["project"].(string)
+		threshold := intArg(req, "threshold", 5000)
+		keepChars := intArg(req, "keep_chars", 500)
+
+		if len(content) <= threshold {
+			return mcp.NewToolResultText(content), nil
+		}
+
+		saved, err := s.SaveToolResult(store.ToolResultParams{
+			Content:   content,
+			SessionID: sessionID,
+			Project:   project,
+		})
+		if err != nil {
+			return mcp.NewToolResultError("Failed to save tool result: " + err.Error()), nil
+		}
+
+		preview := content
+		if len(preview) > keepChars {
+			preview = preview[:keepChars]
+		}
+
+		result := fmt.Sprintf("%s\n[...TRUNCATED. Full content saved. ID: %s (%d bytes)]",
+			preview, saved.ID, saved.SizeBytes)
+		return mcp.NewToolResultText(result), nil
+	}
+}
+
+func handleGetToolResult(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, _ := req.GetArguments()["id"].(string)
+		if id == "" {
+			return mcp.NewToolResultError("id is required"), nil
+		}
+
+		content, err := s.GetToolResult(id)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		return mcp.NewToolResultText(content), nil
 	}
 }
 

@@ -52,6 +52,9 @@ var (
 	storeSearch = func(s *store.Store, query string, opts store.SearchOptions) ([]store.SearchResult, error) {
 		return s.Search(query, opts)
 	}
+	storeGetObservationsByDate = func(s *store.Store, date, project, scope string) ([]store.Observation, error) {
+		return s.GetObservationsByDate(date, project, scope)
+	}
 	storeAddObservation = func(s *store.Store, p store.AddObservationParams) (int64, error) { return s.AddObservation(p) }
 	storeTimeline       = func(s *store.Store, observationID int64, before, after int) (*store.TimelineResult, error) {
 		return s.Timeline(observationID, before, after)
@@ -102,6 +105,8 @@ func main() {
 		cmdContext(cfg)
 	case "stats":
 		cmdStats(cfg)
+	case "digest":
+		cmdDigest(cfg)
 	case "export":
 		cmdExport(cfg)
 	case "import":
@@ -437,6 +442,78 @@ func cmdStats(cfg store.Config) {
 	fmt.Printf("  Database:     %s/engram.db\n", cfg.DataDir)
 }
 
+func cmdDigest(cfg store.Config) {
+	date := ""
+	project := ""
+	outDir := ""
+	toStdout := false
+
+	for i := 2; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "--project":
+			if i+1 < len(os.Args) {
+				project = os.Args[i+1]
+				i++
+			}
+		case "--dir":
+			if i+1 < len(os.Args) {
+				outDir = os.Args[i+1]
+				i++
+			}
+		case "--stdout":
+			toStdout = true
+		default:
+			if date == "" && !strings.HasPrefix(os.Args[i], "--") {
+				date = os.Args[i]
+			}
+		}
+	}
+
+	if date == "" {
+		date = store.Now()[:10]
+	}
+	if project == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			project = filepath.Base(cwd)
+		}
+	}
+
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+	}
+	defer s.Close()
+
+	obs, err := storeGetObservationsByDate(s, date, project, "")
+	if err != nil {
+		fatal(err)
+	}
+
+	digest := store.GenerateDigest(obs, date, project)
+
+	if toStdout {
+		fmt.Print(digest)
+		return
+	}
+
+	// Write to file
+	if outDir == "" {
+		home, _ := os.UserHomeDir()
+		outDir = filepath.Join(home, ".engram", "memory", project)
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		fatal(fmt.Errorf("create digest dir: %w", err))
+	}
+
+	outFile := filepath.Join(outDir, date+".md")
+	if err := os.WriteFile(outFile, []byte(digest), 0644); err != nil {
+		fatal(fmt.Errorf("write digest: %w", err))
+	}
+
+	fmt.Printf("Digest written to %s\n", outFile)
+	fmt.Printf("  Observations: %d\n", len(obs))
+}
+
 func cmdExport(cfg store.Config) {
 	outFile := "engram-export.json"
 	if len(os.Args) > 2 {
@@ -699,6 +776,7 @@ Commands:
   timeline <obs_id>  Show chronological context around an observation [--before N] [--after N]
   context [project]  Show recent context from previous sessions
   stats              Show memory system statistics
+  digest [date]      Generate daily Markdown digest [--project P] [--dir D] [--stdout]
   export [file]      Export all memories to JSON (default: engram-export.json)
   import <file>      Import memories from a JSON export file
   setup [agent]      Install/setup agent integration (opencode, claude-code, gemini-cli, codex)
