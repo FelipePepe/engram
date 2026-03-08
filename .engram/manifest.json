@@ -40,6 +40,14 @@
       "sessions": 2,
       "memories": 3,
       "prompts": 0
+    },
+    {
+      "id": "f681aeaa",
+      "created_by": "felipe",
+      "created_at": "2026-03-08T17:08:58Z",
+      "sessions": 2,
+      "memories": 15,
+      "prompts": 0
     }
   ]
 }
