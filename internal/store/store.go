@@ -340,6 +340,12 @@ func New(cfg Config) (*Store, error) {
 	// Cleanup expired tool results on startup (non-fatal)
 	s.CleanupToolResults()
 
+	if _, err := os.Stat(s.memoryMirrorIndexPath()); err != nil {
+		if err := s.rebuildMemoryMirror(); err != nil {
+			fmt.Fprintf(os.Stderr, "engram: memory mirror rebuild failed: %v\n", err)
+		}
+	}
+
 	return s, nil
 }
 
@@ -757,6 +763,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 			); err != nil {
 				return 0, err
 			}
+			s.refreshMemoryMirrorForObservation(existingID)
 			return existingID, nil
 		}
 		if err != sql.ErrNoRows {
@@ -790,6 +797,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 		); err != nil {
 			return 0, err
 		}
+		s.refreshMemoryMirrorForObservation(existingID)
 		return existingID, nil
 	}
 	if err != sql.ErrNoRows {
@@ -805,7 +813,12 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	newID, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	s.refreshMemoryMirrorForObservation(newID)
+	return newID, nil
 }
 
 func (s *Store) RecentObservations(project, scope string, limit int) ([]Observation, error) {
@@ -851,7 +864,12 @@ func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	newID, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	s.refreshMemoryMirrorForObservation(newID)
+	return newID, nil
 }
 
 func (s *Store) RecentPrompts(project string, limit int) ([]Prompt, error) {
@@ -1017,13 +1035,27 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 		return nil, err
 	}
 
-	return s.GetObservation(id)
+	updated, err := s.GetObservation(id)
+	if err != nil {
+		return nil, err
+	}
+	s.refreshMemoryMirrorForDate(observationDate(updated))
+	return updated, nil
 }
 
 func (s *Store) DeleteObservation(id int64, hardDelete bool) error {
+	date := ""
+	if obs, err := s.GetObservation(id); err == nil {
+		date = observationDate(obs)
+	}
+
 	if hardDelete {
 		_, err := s.db.Exec(`DELETE FROM observations WHERE id = ?`, id)
-		return err
+		if err != nil {
+			return err
+		}
+		s.refreshMemoryMirrorForDate(date)
+		return nil
 	}
 	_, err := s.db.Exec(
 		`UPDATE observations
@@ -1032,7 +1064,11 @@ func (s *Store) DeleteObservation(id int64, hardDelete bool) error {
 		 WHERE id = ? AND deleted_at IS NULL`,
 		id,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	s.refreshMemoryMirrorForDate(date)
+	return nil
 }
 
 // ─── Timeline ────────────────────────────────────────────────────────────────
@@ -1457,6 +1493,10 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 		return nil, fmt.Errorf("import: commit: %w", err)
 	}
 
+	if err := s.rebuildMemoryMirror(); err != nil {
+		fmt.Fprintf(os.Stderr, "engram: memory mirror rebuild failed: %v\n", err)
+	}
+
 	return result, nil
 }
 
@@ -1533,6 +1573,161 @@ func GenerateDigest(observations []Observation, date, project string) string {
 	}
 
 	return b.String()
+}
+
+// ─── Memory Mirror ───────────────────────────────────────────────────────────
+
+type memoryIndexEntry struct {
+	Date  string
+	Count int
+}
+
+func (s *Store) memoryMirrorDir() string {
+	return filepath.Join(s.cfg.DataDir, "memory")
+}
+
+func (s *Store) memoryMirrorIndexPath() string {
+	return filepath.Join(s.cfg.DataDir, "MEMORY.md")
+}
+
+func (s *Store) memoryMirrorDayPath(date string) string {
+	return filepath.Join(s.memoryMirrorDir(), date+".md")
+}
+
+func (s *Store) refreshMemoryMirrorForObservation(id int64) {
+	obs, err := s.GetObservation(id)
+	if err != nil {
+		return
+	}
+	s.refreshMemoryMirrorForDate(observationDate(obs))
+}
+
+func (s *Store) refreshMemoryMirrorForDate(date string) {
+	if date == "" {
+		return
+	}
+	if err := s.refreshMemoryMirror(date); err != nil {
+		fmt.Fprintf(os.Stderr, "engram: memory mirror refresh failed: %v\n", err)
+	}
+}
+
+func (s *Store) refreshMemoryMirror(date string) error {
+	if err := os.MkdirAll(s.memoryMirrorDir(), 0755); err != nil {
+		return fmt.Errorf("mirror dir: %w", err)
+	}
+
+	obs, err := s.GetObservationsByDate(date, "", "")
+	if err != nil {
+		return fmt.Errorf("mirror load date %s: %w", date, err)
+	}
+
+	dayPath := s.memoryMirrorDayPath(date)
+	if len(obs) == 0 {
+		_ = os.Remove(dayPath)
+		return s.writeMemoryIndex()
+	}
+
+	digest := GenerateDigest(obs, date, "")
+	if err := os.WriteFile(dayPath, []byte(digest), 0644); err != nil {
+		return fmt.Errorf("mirror write %s: %w", dayPath, err)
+	}
+
+	return s.writeMemoryIndex()
+}
+
+func (s *Store) rebuildMemoryMirror() error {
+	if err := os.MkdirAll(s.memoryMirrorDir(), 0755); err != nil {
+		return fmt.Errorf("mirror dir: %w", err)
+	}
+
+	entries, err := s.listMemoryIndexEntries()
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		obs, err := s.GetObservationsByDate(entry.Date, "", "")
+		if err != nil {
+			return err
+		}
+		if len(obs) == 0 {
+			_ = os.Remove(s.memoryMirrorDayPath(entry.Date))
+			continue
+		}
+		digest := GenerateDigest(obs, entry.Date, "")
+		if err := os.WriteFile(s.memoryMirrorDayPath(entry.Date), []byte(digest), 0644); err != nil {
+			return fmt.Errorf("mirror write %s: %w", entry.Date, err)
+		}
+	}
+
+	return s.writeMemoryIndexWith(entries)
+}
+
+func (s *Store) listMemoryIndexEntries() ([]memoryIndexEntry, error) {
+	rows, err := s.queryItHook(s.db,
+		`SELECT date(created_at) AS day, COUNT(*)
+ 		 FROM observations
+ 		 WHERE deleted_at IS NULL
+ 		 GROUP BY day
+ 		 ORDER BY day DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []memoryIndexEntry
+	for rows.Next() {
+		var entry memoryIndexEntry
+		if err := rows.Scan(&entry.Date, &entry.Count); err != nil {
+			return nil, err
+		}
+		if entry.Date == "" {
+			continue
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+func (s *Store) writeMemoryIndex() error {
+	entries, err := s.listMemoryIndexEntries()
+	if err != nil {
+		return err
+	}
+	return s.writeMemoryIndexWith(entries)
+}
+
+func (s *Store) writeMemoryIndexWith(entries []memoryIndexEntry) error {
+	var b strings.Builder
+	b.WriteString("# Memory Index\n\n")
+	if len(entries) == 0 {
+		b.WriteString("No observations yet.\n")
+		return os.WriteFile(s.memoryMirrorIndexPath(), []byte(b.String()), 0644)
+	}
+
+	for _, entry := range entries {
+		label := "observations"
+		if entry.Count == 1 {
+			label = "observation"
+		}
+		fmt.Fprintf(&b, "- [%s](memory/%s.md) — %d %s\n", entry.Date, entry.Date, entry.Count, label)
+	}
+
+	return os.WriteFile(s.memoryMirrorIndexPath(), []byte(b.String()), 0644)
+}
+
+func observationDate(obs *Observation) string {
+	if obs == nil {
+		return ""
+	}
+	if len(obs.CreatedAt) >= 10 {
+		return obs.CreatedAt[:10]
+	}
+	return ""
 }
 
 // ─── Tool Results ─────────────────────────────────────────────────────────────

@@ -79,6 +79,98 @@ func TestHandleSuggestTopicKeyRequiresInput(t *testing.T) {
 	}
 }
 
+
+func TestHandleCompactToolBelowThresholdReturnsOriginal(t *testing.T) {
+    s := newMCPTestStore(t)
+    h := handleCompactTool(s)
+
+    req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+        "content":    "short text",
+        "session_id": "s1",
+        "project":    "engram",
+        "threshold":  100.0,
+    }}}
+
+    res, err := h(context.Background(), req)
+    if err != nil {
+        t.Fatalf("handler error: %v", err)
+    }
+    if res.IsError {
+        t.Fatalf("unexpected tool error: %s", callResultText(t, res))
+    }
+    if callResultText(t, res) != "short text" {
+        t.Fatalf("expected original text")
+    }
+}
+
+func TestHandleCompactToolSavesAndReturnsReference(t *testing.T) {
+    s := newMCPTestStore(t)
+    h := handleCompactTool(s)
+
+    content := strings.Repeat("a", 200)
+    req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+        "content":    content,
+        "session_id": "s1",
+        "project":    "engram",
+        "threshold":  50.0,
+        "keep_chars": 10.0,
+    }}}
+
+    res, err := h(context.Background(), req)
+    if err != nil {
+        t.Fatalf("handler error: %v", err)
+    }
+    if res.IsError {
+        t.Fatalf("unexpected tool error: %s", callResultText(t, res))
+    }
+    text := callResultText(t, res)
+    if !strings.Contains(text, "TRUNCATED") || !strings.Contains(text, "ID:") {
+        t.Fatalf("expected truncated marker and id in response, got %q", text)
+    }
+}
+
+func TestHandleGetToolResultRequiresID(t *testing.T) {
+    s := newMCPTestStore(t)
+    h := handleGetToolResult(s)
+
+    req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{}}}
+    res, err := h(context.Background(), req)
+    if err != nil {
+        t.Fatalf("handler error: %v", err)
+    }
+    if !res.IsError {
+        t.Fatalf("expected error when id missing")
+    }
+}
+
+func TestHandleGetToolResultReturnsContent(t *testing.T) {
+    s := newMCPTestStore(t)
+    saved, err := s.SaveToolResult(store.ToolResultParams{
+        Content:   "full content",
+        SessionID: "s1",
+        Project:   "engram",
+    })
+    if err != nil {
+        t.Fatalf("save tool result: %v", err)
+    }
+
+    h := handleGetToolResult(s)
+    req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+        "id": saved.ID,
+    }}}
+
+    res, err := h(context.Background(), req)
+    if err != nil {
+        t.Fatalf("handler error: %v", err)
+    }
+    if res.IsError {
+        t.Fatalf("unexpected tool error: %s", callResultText(t, res))
+    }
+    if callResultText(t, res) != "full content" {
+        t.Fatalf("unexpected content")
+    }
+}
+
 func TestHandleSaveSuggestsTopicKeyWhenMissing(t *testing.T) {
 	s := newMCPTestStore(t)
 	h := handleSave(s)
