@@ -55,118 +55,117 @@ func (f *fakeRows) Close() error {
 	return nil
 }
 
-
 func TestSaveToolResultWritesFileAndDB(t *testing.T) {
-    s := newTestStore(t)
-    saved, err := s.SaveToolResult(ToolResultParams{
-        Content:   "hello world",
-        SessionID: "s1",
-        Project:   "engram",
-    })
-    if err != nil {
-        t.Fatalf("save tool result: %v", err)
-    }
-    if saved.ID == "" {
-        t.Fatalf("expected tool result id")
-    }
-    if _, err := os.Stat(saved.FilePath); err != nil {
-        t.Fatalf("expected tool result file: %v", err)
-    }
-    data, err := os.ReadFile(saved.FilePath)
-    if err != nil {
-        t.Fatalf("read tool result file: %v", err)
-    }
-    if string(data) != "hello world" {
-        t.Fatalf("unexpected file content: %q", string(data))
-    }
+	s := newTestStore(t)
+	saved, err := s.SaveToolResult(ToolResultParams{
+		Content:   "hello world",
+		SessionID: "s1",
+		Project:   "engram",
+	})
+	if err != nil {
+		t.Fatalf("save tool result: %v", err)
+	}
+	if saved.ID == "" {
+		t.Fatalf("expected tool result id")
+	}
+	if _, err := os.Stat(saved.FilePath); err != nil {
+		t.Fatalf("expected tool result file: %v", err)
+	}
+	data, err := os.ReadFile(saved.FilePath)
+	if err != nil {
+		t.Fatalf("read tool result file: %v", err)
+	}
+	if string(data) != "hello world" {
+		t.Fatalf("unexpected file content: %q", string(data))
+	}
 }
 
 func TestGetToolResultExpired(t *testing.T) {
-    s := newTestStore(t)
-    saved, err := s.SaveToolResult(ToolResultParams{
-        Content:   "expired",
-        SessionID: "s1",
-        Project:   "engram",
-    })
-    if err != nil {
-        t.Fatalf("save tool result: %v", err)
-    }
-    if _, err := s.db.Exec(`UPDATE tool_results SET expires_at = datetime('now','-1 day') WHERE id = ?`, saved.ID); err != nil {
-        t.Fatalf("expire tool result: %v", err)
-    }
-    if _, err := s.GetToolResult(saved.ID); err == nil {
-        t.Fatalf("expected expired tool result to error")
-    }
+	s := newTestStore(t)
+	saved, err := s.SaveToolResult(ToolResultParams{
+		Content:   "expired",
+		SessionID: "s1",
+		Project:   "engram",
+	})
+	if err != nil {
+		t.Fatalf("save tool result: %v", err)
+	}
+	if _, err := s.db.Exec(`UPDATE tool_results SET expires_at = datetime('now','-1 day') WHERE id = ?`, saved.ID); err != nil {
+		t.Fatalf("expire tool result: %v", err)
+	}
+	if _, err := s.GetToolResult(saved.ID); err == nil {
+		t.Fatalf("expected expired tool result to error")
+	}
 }
 
 func TestCleanupToolResultsRemovesExpiredFiles(t *testing.T) {
-    s := newTestStore(t)
-    expired, err := s.SaveToolResult(ToolResultParams{
-        Content:   "expired",
-        SessionID: "s1",
-        Project:   "engram",
-    })
-    if err != nil {
-        t.Fatalf("save tool result: %v", err)
-    }
-    kept, err := s.SaveToolResult(ToolResultParams{
-        Content:   "kept",
-        SessionID: "s1",
-        Project:   "engram",
-    })
-    if err != nil {
-        t.Fatalf("save tool result: %v", err)
-    }
-    if _, err := s.db.Exec(`UPDATE tool_results SET expires_at = datetime('now','-1 day') WHERE id = ?`, expired.ID); err != nil {
-        t.Fatalf("expire tool result: %v", err)
-    }
-    count, err := s.CleanupToolResults()
-    if err != nil {
-        t.Fatalf("cleanup: %v", err)
-    }
-    if count != 1 {
-        t.Fatalf("expected 1 cleanup, got %d", count)
-    }
-    if _, err := os.Stat(expired.FilePath); !os.IsNotExist(err) {
-        t.Fatalf("expected expired file removed")
-    }
-    if _, err := os.Stat(kept.FilePath); err != nil {
-        t.Fatalf("expected kept file present: %v", err)
-    }
+	s := newTestStore(t)
+	expired, err := s.SaveToolResult(ToolResultParams{
+		Content:   "expired",
+		SessionID: "s1",
+		Project:   "engram",
+	})
+	if err != nil {
+		t.Fatalf("save tool result: %v", err)
+	}
+	kept, err := s.SaveToolResult(ToolResultParams{
+		Content:   "kept",
+		SessionID: "s1",
+		Project:   "engram",
+	})
+	if err != nil {
+		t.Fatalf("save tool result: %v", err)
+	}
+	if _, err := s.db.Exec(`UPDATE tool_results SET expires_at = datetime('now','-1 day') WHERE id = ?`, expired.ID); err != nil {
+		t.Fatalf("expire tool result: %v", err)
+	}
+	count, err := s.CleanupToolResults()
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 cleanup, got %d", count)
+	}
+	if _, err := os.Stat(expired.FilePath); !os.IsNotExist(err) {
+		t.Fatalf("expected expired file removed")
+	}
+	if _, err := os.Stat(kept.FilePath); err != nil {
+		t.Fatalf("expected kept file present: %v", err)
+	}
 }
 
 func TestMemoryMirrorWritesFiles(t *testing.T) {
-    s := newTestStore(t)
-    if err := s.CreateSession("s1", "engram", "/tmp/engram"); err != nil {
-        t.Fatalf("create session: %v", err)
-    }
-    _, err := s.AddObservation(AddObservationParams{
-        SessionID: "s1",
-        Type:      "decision",
-        Title:     "Mirror test",
-        Content:   "write mirror",
-        Project:   "engram",
-        Scope:     "project",
-    })
-    if err != nil {
-        t.Fatalf("add observation: %v", err)
-    }
-    date := Now()[:10]
-    indexPath := filepath.Join(s.cfg.DataDir, "MEMORY.md")
-    dayPath := filepath.Join(s.cfg.DataDir, "memory", date+".md")
-    if _, err := os.Stat(indexPath); err != nil {
-        t.Fatalf("expected MEMORY.md: %v", err)
-    }
-    if _, err := os.Stat(dayPath); err != nil {
-        t.Fatalf("expected day mirror: %v", err)
-    }
-    data, err := os.ReadFile(dayPath)
-    if err != nil {
-        t.Fatalf("read day mirror: %v", err)
-    }
-    if !strings.Contains(string(data), "Mirror test") {
-        t.Fatalf("expected mirror content to include observation title")
-    }
+	s := newTestStore(t)
+	if err := s.CreateSession("s1", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Mirror test",
+		Content:   "write mirror",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	date := Now()[:10]
+	indexPath := filepath.Join(s.cfg.DataDir, "MEMORY.md")
+	dayPath := filepath.Join(s.cfg.DataDir, "memory", date+".md")
+	if _, err := os.Stat(indexPath); err != nil {
+		t.Fatalf("expected MEMORY.md: %v", err)
+	}
+	if _, err := os.Stat(dayPath); err != nil {
+		t.Fatalf("expected day mirror: %v", err)
+	}
+	data, err := os.ReadFile(dayPath)
+	if err != nil {
+		t.Fatalf("read day mirror: %v", err)
+	}
+	if !strings.Contains(string(data), "Mirror test") {
+		t.Fatalf("expected mirror content to include observation title")
+	}
 }
 
 func TestAddObservationDeduplicatesWithinWindow(t *testing.T) {
