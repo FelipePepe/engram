@@ -864,12 +864,7 @@ func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	newID, err := res.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
-	s.refreshMemoryMirrorForObservation(newID)
-	return newID, nil
+	return res.LastInsertId()
 }
 
 func (s *Store) RecentPrompts(project string, limit int) ([]Prompt, error) {
@@ -1636,13 +1631,39 @@ func (s *Store) refreshMemoryMirror(date string) error {
 }
 
 func (s *Store) rebuildMemoryMirror() error {
-	if err := os.MkdirAll(s.memoryMirrorDir(), 0755); err != nil {
+	mirrorDir := s.memoryMirrorDir()
+	if err := os.MkdirAll(mirrorDir, 0755); err != nil {
 		return fmt.Errorf("mirror dir: %w", err)
 	}
 
 	entries, err := s.listMemoryIndexEntries()
 	if err != nil {
 		return err
+	}
+
+	// Build set of valid dates to detect orphan files.
+	validDates := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		validDates[entry.Date] = struct{}{}
+	}
+
+	// Remove orphan day files (dates with no active observations).
+	dirEntries, err := os.ReadDir(mirrorDir)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("mirror readdir: %w", err)
+	}
+	for _, de := range dirEntries {
+		if de.IsDir() {
+			continue
+		}
+		name := de.Name()
+		if len(name) != 13 || name[10:] != ".md" { // YYYY-MM-DD.md
+			continue
+		}
+		date := name[:10]
+		if _, ok := validDates[date]; !ok {
+			_ = os.Remove(filepath.Join(mirrorDir, name))
+		}
 	}
 
 	for _, entry := range entries {
